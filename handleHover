@@ -1,0 +1,16 @@
+_handleHandHover(handLandmarks) {
+    if (!this.hoverState.hoverEnabled) return;
+
+    // Get the first landmark (tip of index finger)
+    const indexFingerTip = handLandmarks[8];
+
+    // Normalize coordinates from the full screen (0 to 1)
+    // Three.js Raycaster expects coordinates from -1 to +1
+    this.mouse.x = (indexFingerTip.x) * 2 - 1;
+    this.mouse.y = -(indexFingerTip.y) * 2 + 1;
+
+    // Update the raycaster with the new normalized coordinates
+    this.raycaster.setFromCamera(this.mouse, this.cameraController.getCamera());
+
+    // ... The rest of your existing hover/pinch logic ...
+}
