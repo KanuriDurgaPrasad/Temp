@@ -1,0 +1,1786 @@
+app.js
+------
+
+import $ from 'jquery';
+import BaseEngine from "./baseEngine";
+import { CameraController } from "./cameraController";
+import { ACTIVE_PATH } from "./config";
+import { Interface } from './interface';
+import { SceneManager } from './sceneManager';
+import { AnimUtils, NetworkUtils } from "./utilities";
+import { HandController } from './handController';
+import { Raycaster, Vector2 } from 'three';
+
+class App extends BaseEngine {
+
+    constructor() {
+        // Must call super() first in a derived class constructor
+        super();
+        this.loadErrorSet = false;
+        this.demoStarted = false;
+        this.meta = {};
+
+        this.audioTrack = new Audio('assets/audio_track.mp3');
+        this.audioTrack.volume = 0;
+
+        this.cameraController = new CameraController(this.renderer, window.innerWidth / window.innerHeight);
+        SceneManager.init(this.manager);
+
+        this.manager.onProgress = this.onLoadProgress.bind(this);
+        this.manager.onError = this.onLoadError.bind(this);
+        this.manager.onLoad = this.onLoadCompleted.bind(this);
+
+        window.addEventListener('resize', this.onContextResized.bind(this), true);
+        $('#btn-start-demo')[0].addEventListener('click', this.startDemo.bind(this));
+        $('#btn-skip-intro')[0].addEventListener('click', this.skipIntro.bind(this));
+        this.cameraController.setOnCineComplete(this.skipIntro.bind(this));
+
+        Interface.setOnEntityColor(SceneManager.setEntityColor);
+        Interface.setOnEntityVisible(SceneManager.setEntityVisible);
+        this.setupScene();
+        this.onContextResized();
+
+        document.getElementById('screenshotButton').addEventListener('click', this.captureScreenshot.bind(this));
+
+        // Add event listeners for door animation buttons
+        const openDoorBtn = document.getElementById('open-door-btn');
+        const closeDoorBtn = document.getElementById('close-door-btn');
+        if (openDoorBtn) {
+            openDoorBtn.addEventListener('click', () => {
+                SceneManager.animateDoor(true);
+            });
+        }
+        if (closeDoorBtn) {
+            closeDoorBtn.addEventListener('click', () => {
+                SceneManager.animateDoor(false);
+            });
+        }
+        
+        // Corrected: Define Raycaster and Vector2 as class properties
+        this.raycaster = new Raycaster();
+        this.mouse = new Vector2();
+        this.doorOpen = false;
+
+        // Corrected: Use a bound method for the mouse click event listener to handle 'this' context
+        this.renderer.domElement.addEventListener('click', this._handleDoorClick.bind(this));
+
+        this.update();
+    }
+
+    // New method to handle mouse clicks on the door model
+    _handleDoorClick(event) {
+        // Convert mouse position to normalized device coordinates
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.cameraController.mainCamera);
+
+        // Intersect objects in the scene
+        const intersects = this.raycaster.intersectObjects(this.scene.children, true);
+        
+        // Find the intersection with the door
+        const doorIntersection = intersects.find(obj => obj.object.name === 'Obj_Side_Doors' || obj.object.name === "Mesh_Door_LH001_1");
+
+        if (doorIntersection) {
+            this.doorOpen = !this.doorOpen;
+            SceneManager.animateDoor(this.doorOpen);
+        }
+    }
+
+    // This method will now always have the correct 'this' context.
+    async _startHands() {
+        if (this.handsStarted) return;
+        this.handsStarted = true;
+
+        const videoEl = document.getElementById('mp-video');
+        const overlayCanvas = document.getElementById('mp-canvas');
+
+        try {
+            this.handController = new HandController({
+                videoEl,
+                overlayCanvas,
+                orbitControls: this.cameraController.orbitControls,
+                camera: this.cameraController.orbitCamera,
+                renderer: this.renderer,
+                scene: this.scene, // This is now correctly defined
+                onHover: this._handleHandHover.bind(this)
+            });
+
+            if (videoEl) videoEl.style.display = 'block';
+            if (overlayCanvas) overlayCanvas.style.display = 'block';
+
+            await this.handController.init();
+        } catch (e) {
+            console.error('Failed to init MediaPipe Hands:', e);
+            this.handsStarted = false;
+        }
+    }
+
+    _setupHandControl() {
+        this.hoverTimer = null;
+        this.hoveredElement = null;
+        this.handsStarted = false;
+
+        // Corrected line: Bind the _startHands method to 'this'
+        $('#btn-start-demo').one('click', this._startHands.bind(this));
+        $('#btn-skip-intro').one('click', this._startHands.bind(this));
+    }
+
+    // Modified _handleHandHover method to work with the 3D scene
+    _handleHandHover(coords) {
+        // Convert normalized device coordinates
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.mouse.x = ((coords.x - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((coords.y - rect.top) / rect.height) * 2 + 1;
+    
+        // Cast a ray from the camera through the mouse coordinates
+        this.raycaster.setFromCamera(this.mouse, this.cameraController.mainCamera);
+    
+        // Intersect with objects in the scene
+        const intersects = this.raycaster.intersectObjects(this.scene.children, true);
+    
+        // Filter for the door objects
+        const doorIntersection = intersects.find(obj => obj.object.name === 'Obj_Side_Doors' || obj.object.name === "Mesh_Door_LH001_1");
+    
+        if (doorIntersection) {
+            // If we are hovering over the door
+            if (!this.hoverTimer) {
+                // Set hover time to 2 seconds
+                this.hoverTimer = setTimeout(() => {
+                    this.doorOpen = !this.doorOpen;
+                    SceneManager.animateDoor(this.doorOpen);
+                    this.hoverTimer = null; // Reset the timer after triggering
+                }, 1500);
+            }
+        } else {
+            // Reset if a new or no object is hovered
+            clearTimeout(this.hoverTimer);
+            this.hoverTimer = null;
+        }
+    }
+
+    setupScene() {
+        SceneManager.loadStage(this.scene);
+        NetworkUtils.fetchMeta(ACTIVE_PATH, meta => {
+            this.meta = meta;
+            SceneManager.loadActiveModel(this.scene, this.meta);
+        });
+    }
+
+    onLoadError(item) {
+        $('#preloader .icon').remove();
+        $('#preloader .title').text("ERROR LOADING");
+        $('#preloader .desc').text(item);
+        this.loadErrorSet = true;
+    }
+
+    onLoadProgress(item, loaded, total) {
+        if (this.loadErrorSet) return;
+        $('#preloader .desc').text(item);
+    }
+
+    onLoadCompleted() {
+        if (this.loadErrorSet) return;
+        $('#preloader .icon').remove();
+        $('#preloader .title').text('Automotive Configurator');
+        $('#preloader .desc').html('A ThreeJS based car configurator. This is a demo.');
+        $('#preloader .btn-main').show();
+
+        this._setupHandControl();
+    }
+
+    onContextResized() {
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.cameraController.setAspect(window.innerWidth / window.innerHeight);
+    }
+
+    startDemo() {
+        if (this.loadErrorSet || this.demoStarted) return;
+        this.demoStarted = true;
+
+        AnimUtils.fadeElementOut(this.loadErrorSet ? $('#preloader')[0] : $('#preloader')[0], 900, element => {
+            element.remove();
+            AnimUtils.fadeElementIn($('#welcome-screen')[0], 900, { display: 'flex' });
+        });
+        this.cameraController.startCinematic();
+
+        AnimUtils.fadeAudioIn(this.audioTrack, 2000, { max: 0.5 });
+    }
+
+    skipIntro() {
+        document.getElementById("config_palette").style.display = "block";
+        AnimUtils.fadeElementOut(this.audioTrack, 2000, () => this.audioTrack.remove());
+
+        AnimUtils.fadeElementIn($('#screen-fader')[0], 900, { display: 'flex' }, (fader) => {
+            this.cameraController.stopCinematic();
+            this.cameraController.mainCamera = this.cameraController.orbitCamera;
+            this.cameraController.setAspect(window.innerWidth / window.innerHeight);
+            $('#welcome-screen').remove();
+
+            // Initialize interface without delays to keep responsiveness
+            Interface.initialize(this.meta);
+
+            AnimUtils.fadeElementOut(fader, 900);
+            AnimUtils.fadeElementIn($('#app-authoring')[0], 900);
+        });
+    }
+
+    captureScreenshot() {
+        this.renderer.render(this.scene, this.cameraController.mainCamera);
+        const canvas = this.renderer.domElement;
+        const dataURL = canvas.toDataURL("image/png");
+        const link = document.createElement('a');
+        link.href = dataURL;
+        link.download = 'screenshot.png';
+        link.click();
+    }
+
+    update() {
+        super.update();
+        this.cameraController.update();
+        this.renderer.render(this.scene, this.cameraController.mainCamera);
+        requestAnimationFrame(this.update.bind(this));
+    }
+}
+
+export default new App();
+
+--------
+
+baseEngine.js
+-------------
+/*
+ * Project :WebGL Car Configurator
+ * File: baseEngine.js
+ * Description : Wrapper for ThreeJS renderer
+ * Date : 10/09/2021
+ * License : MIT
+ * Author : RendercodeNinja
+ * URL : https://github.com/RendercodeNinja
+ */
+
+import * as THREE from 'three';
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
+import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper';
+import Stats from 'three/examples/jsm/libs/stats.module';
+import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib';
+import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader';
+import { EXR_FILE, EXR_PATH } from './config';
+import { MathUtils } from './utilities';
+
+let textureLoader;
+let gltfLoader;
+let currentModel = null;
+let currentImage = null;
+//Whether to show fps counter or not
+const IS_DEBUG = false;
+
+//Scene background color
+const SCENE_COLOR = 0x000000;
+
+//Area Light Dimension
+const LIGHT_SIZE = new THREE.Vector2(12, 6);
+//Area Light Intensity
+const LIGHT_INTENSITY = 8;
+//Area Light Color
+const LIGHT_COLOR = 0xffffff;
+//Area Light - Left
+const LIGHT_POS_LEFT = new THREE.Vector3(0, 16, -18);
+const LIGHT_ROT_LEFT = MathUtils.vector3DegToRadian({ x: -135, y: 0, z: -180 });
+//Area Light - Right
+const LIGHT_POS_RIGHT = new THREE.Vector3(0, 16, 18);
+const LIGHT_ROT_RIGHT = MathUtils.vector3DegToRadian({ x: -45, y: 0, z: 0 });
+
+//------------------------------------------------------------ PRIVATE HELPER METHODS ------------------------------------------------------------
+
+//Create an AreaLight with Helper
+const createAreaLight = (color, intensity, size, visible) => {
+
+    //Create an area light with parameters
+    var rectLight = new THREE.RectAreaLight(color, intensity, size.x, size.y);
+
+    //Create a light helper if set to visible
+    if (visible) {
+        const rectHelper = new RectAreaLightHelper(rectLight, 0xffffff);
+        rectLight.add(rectHelper);
+    }
+
+    //Return the resultant light object
+    return rectLight;
+}
+
+//------------------------------------------------------------ ENGINE ABSTRACT CLASS ------------------------------------------------------------
+
+export default class BaseEngine {
+
+    //Class constructor
+    constructor() {
+
+        //Initialize Area Light Plugin Lib
+        RectAreaLightUniformsLib.init();
+
+        //Create engine renderer
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setPixelRatio(window.devicePixelRatio);
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setClearColor(SCENE_COLOR, 1);
+        this.renderer.sortObjects = false;
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 1.0;
+        this.renderer.outputEncoding = THREE.sRGBEncoding;
+
+        //Append renderer to body context
+        document.body.appendChild(this.renderer.domElement);
+
+        //Create root scene node
+        this.scene = new THREE.Scene();
+
+
+
+        // Create a texture loader
+        // Initialize loaders
+        textureLoader = new THREE.TextureLoader();
+        const init = (loaderManager) => {
+            //Create a GLTF Loader
+            gltfLoader = new GLTFLoader(loaderManager);
+        }
+        init();
+        // Current background or model
+        let currentBackground = null;
+        let currentModel = null;
+
+        // Image elements for textures
+        const textureImageIds = ['environment-img-1', 'environment-img-2'];
+        textureImageIds.forEach(id => {
+            const imageElement = document.getElementById(id);
+            imageElement.addEventListener('click', () => {
+                const imageUrl = imageElement.getAttribute('src');
+                if (currentModel) {
+                    this.scene.remove(currentModel);
+                    currentModel = null;
+                }
+                if (currentBackground) {
+                    this.scene.background = null;
+                }
+                textureLoader.load(imageUrl, (texture) => {
+                    this.scene.background = texture;
+                    currentBackground = texture;
+                }, undefined, (error) => {
+                    console.error('Error loading texture:', error);
+                });
+            });
+        });
+
+        // Image elements for models
+        const modelImages = [
+            { id: 'environment-img-3', src: 'images/tunnel_road.glb' },
+            { id: 'environment-img-4', src: 'images/modern_garage.glb' }
+        ];
+        modelImages.forEach(({ id, src }) => {
+            const imageElement = document.getElementById(id);
+            imageElement.addEventListener('click', () => {
+                if (currentBackground) {
+                    this.scene.background = null;
+                    currentBackground = null;
+                }
+                if (currentModel) {
+                    this.scene.remove(currentModel);
+                }
+                gltfLoader.load(src, (gltf) => {
+                    const model = gltf.scene;
+                    model.scale.set(200, 200, 200);
+                    model.position.set(-2, -4, 0);
+                    this.scene.add(model);
+                    currentModel = model;
+                }, undefined, (error) => {
+                    console.error('Error loading model:', error);
+                });
+            });
+        });
+
+
+        //Set scene fog to make soft ground edges
+        this.scene.fog = new THREE.Fog(SCENE_COLOR, 30, 100);
+
+        //Add a Left Light
+        const mLeftLight = createAreaLight(LIGHT_COLOR, LIGHT_INTENSITY, LIGHT_SIZE, IS_DEBUG);
+        mLeftLight.position.copy(LIGHT_POS_LEFT);
+        mLeftLight.rotation.copy(LIGHT_ROT_LEFT)
+        this.scene.add(mLeftLight);
+
+        //Add a Right Light
+        const mRightLight = createAreaLight(LIGHT_COLOR, LIGHT_INTENSITY, LIGHT_SIZE, IS_DEBUG);
+        mRightLight.position.copy(LIGHT_POS_RIGHT);
+        mRightLight.rotation.copy(LIGHT_ROT_RIGHT);
+        this.scene.add(mRightLight);
+
+        //Create a loader manager
+        this.manager = new THREE.LoadingManager();
+
+        //Pre-Filtered, Mip-Mapped Radiance Environment Generator
+        const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
+        //Precompile to use equirectangular shader to support equirectangular HDR maps
+        pmremGenerator.compileEquirectangularShader();
+
+        //Create an RGBE Loader to handle PBR Rendering
+        new EXRLoader(this.manager)
+            .setDataType(THREE.UnsignedByteType)
+            .setPath(EXR_PATH)
+            .load(EXR_FILE, exr => {
+
+                //Generate environment CubeMap from HDR texture
+                const envMap = pmremGenerator.fromEquirectangular(exr).texture;
+
+                //Set scene environment to use generated CubeMap for PBR lighting
+                this.scene.environment = envMap;
+
+                //Cleanup EXR HDR texture and helper
+                exr.dispose(); pmremGenerator.dispose()
+            });
+
+        //If FPS enabled
+        if (IS_DEBUG) {
+            //Create new profiler object
+            this.profiler = Stats();
+            //Append profiler to body context
+            document.body.appendChild(this.profiler.dom);
+        }
+    }
+
+    //Update method
+    update() {
+
+        //Update profiler if enabled
+        if (IS_DEBUG && this.profiler)
+            this.profiler.update();
+    }
+}
+
+
+--------
+
+
+cameraController.js
+-------------------
+
+/*
+ * Project :WebGL Car Configurator
+ * File: cameraController.js
+ * Description : Custom controller for cinematic and orbit camera
+ * Date : 10/09/2021
+ * License : MIT
+ * Author : RendercodeNinja
+ * URL : https://github.com/RendercodeNinja
+ */
+
+import * as TWEEN from '@tweenjs/tween.js';
+import { PerspectiveCamera, Vector3 } from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { MathUtils } from './utilities';
+
+//The camera startup position
+const ORBIT_CAM_POS = new Vector3(-27, 5, 10);
+//The camera lookAt target
+const ORBIT_CAM_TARGET = new Vector3(0, 3, 0);
+
+//The cinematic sequence position array
+const CINE_SEQUENCE_POINTS =
+    [
+        {
+            sP: { x: -28, y: -26, z: 3.5 },
+            eP: { x: -25, y: -23, z: 3.5 },
+            cR: { x: 0.0, y: -45, z: 5.0 },
+            tD: 9500
+        },
+        {
+            sP: { x: -18, y: 0, z: 2.5 },
+            eP: { x: -18, y: 0, z: 5.5 },
+            cR: { x: 0.0, y: -90, z: 0.0 },
+            tD: 5000
+        },
+        {
+            sP: { x: -13.50, y: -3.75, z: 3.75 },
+            eP: { x: -12.00, y: -5.50, z: 4.50 },
+            cR: { x: -41.79, y: -42.36, z: -19.55 },
+            tD: 7000
+        },
+        {
+            sP: { x: -10.50, y: -8.0, z: 1.50 },
+            eP: { x: -14.00, y: -12.0, z: 1.00 },
+            cR: { x: 10.12, y: -43.88, z: -7.06 },
+            tD: 7000
+        },
+        {
+            sP: { x: -13, y: -14, z: 14 },
+            eP: { x: 11, y: -14, z: 14 },
+            cR: { x: -38.28, y: 0.0, z: 0.0 },
+            tD: 12000
+        },
+        {
+            sP: { x: 12.85, y: -1.0, z: 4.35 },
+            eP: { x: 12.85, y: 0.70, z: 4.35 },
+            cR: { x: 47.34, y: 50.53, z: -33.90 },
+            tD: 7000
+        },
+        {
+            sP: { x: 13, y: -4.5, z: 2.5 },
+            eP: { x: 13, y: -4.5, z: 5.0 },
+            cR: { x: 0, y: 58, z: 5.35 },
+            tD: 7000
+        },
+        {
+            sP: { x: -3.3, y: -6.5, z: 5.0 },
+            eP: { x: 1.2, y: -6.5, z: 5.35 },
+            cR: { x: -30.65, y: -55.53, z: -1.88 },
+            tD: 5000
+        },
+        {
+            sP: { x: -13.85, y: -0.35, z: 3.15 },
+            eP: { x: -14.50, y: -1.1, z: 3.75 },
+            cR: { x: -35.54, y: -35.16, z: -15.17 },
+            tD: 8000
+        }
+    ];
+
+export class CameraController {
+
+    //Class constructor
+    constructor(renderer, aspect) {
+
+        //Callback Handler - OnCineComplete
+        this.onCineComplete = () => void 0;
+
+        //Array to keep all cinematic shot tweens
+        this.mCineShotsList = [];
+
+        //Create Cinematic Camera
+        this.cineCamera = new PerspectiveCamera(45, aspect, 0.1, 100);
+        this.cineCamera.position.copy(CINE_SEQUENCE_POINTS[0].sP)
+        this.cineCamera.rotation.copy(MathUtils.vector3DegToRadian(CINE_SEQUENCE_POINTS[0].cR))
+
+        //Create Orbit Camera
+        this.orbitCamera = new PerspectiveCamera(45, aspect, 0.1, 100);
+        this.orbitCamera.position.copy(ORBIT_CAM_POS);
+
+        //Create OrbitControl
+        this.orbitControls = new OrbitControls(this.orbitCamera, renderer.domElement);
+        this.orbitControls.target = ORBIT_CAM_TARGET;
+        this.orbitControls.enablePan = false;
+        this.orbitControls.enableZoom = true;
+        this.orbitControls.enableDamping = true;
+        this.orbitControls.minPolarAngle = 0.75; //Upper
+        this.orbitControls.maxPolarAngle = 1.6; //Lower
+        this.orbitControls.dampingFactor = 0.07;
+        this.orbitControls.rotateSpeed = 0.07;
+        this.orbitControls.minDistance = 16
+        this.orbitControls.maxDistance = 32;
+        this.orbitControls.autoRotate = true;
+        this.orbitControls.autoRotateSpeed = 0.5;
+
+        // this.orbitControls.minPolarAngle = 0.5;
+        // this.orbitControls.maxPolarAngle = 1.8;
+        // this.orbitControls.minDistance = 10;
+        // this.orbitControls.maxDistance = 50;
+
+        //Set cine camera as startup camera
+        this.mainCamera = this.cineCamera;
+
+        //Iterate through each sequence position array
+        for (var i = 0; i < CINE_SEQUENCE_POINTS.length; i++) {
+
+            //Get the tween starting point vector
+            var tweenStartPoint = MathUtils.coordR2L(CINE_SEQUENCE_POINTS[i].sP);
+            //Get the tween end point vector
+            var tweenEndPoint = MathUtils.coordR2L(CINE_SEQUENCE_POINTS[i].eP);
+            //Get the duration for this tween
+            var tweenDuration = CINE_SEQUENCE_POINTS[i].tD;
+
+            //Create the cinematic tween for current sequence
+            var cineTween = new TWEEN.Tween(tweenStartPoint).to(tweenEndPoint, tweenDuration).easing(TWEEN.Easing.Linear.None);
+
+            //On Tween Start
+            cineTween.onStart(((id) => {
+
+                //Apply camera rotation for the tween
+                return () => this.cineCamera.rotation.copy(MathUtils.vector3DegToRadian(CINE_SEQUENCE_POINTS[id].cR))
+
+            })(i));
+
+            //On Tween Update
+            cineTween.onUpdate(pos => { this.cineCamera.position.set(pos.x, pos.y, pos.z); })
+
+            //Add the cinematic tween to shots list
+            this.mCineShotsList.push(cineTween);
+
+            //Chain the shot to previous
+            if (i > 0)
+                this.mCineShotsList[i - 1].chain(this.mCineShotsList[i]);
+        }
+
+        //Event will be triggered when the last tween is completed
+        this.mCineShotsList[this.mCineShotsList.length - 1].onComplete(() => this.onCineComplete());
+    }
+
+    //Event Setter - OnCineComplete
+    setOnCineComplete = (cb) => this.onCineComplete = cb;
+
+    //Update
+    update() {
+
+        //Update orbit controls if main camera is orbit camera
+        if (this.mainCamera === this.orbitCamera)
+            this.orbitControls.update();
+
+        //Update Tween Library
+        TWEEN.update();
+    }
+
+    //Set new aspect and update projection
+    setAspect(aspect) {
+
+        //Recalculate aspect for main camera
+        this.mainCamera.aspect = aspect;
+        //Update the projection matrix
+        this.mainCamera.updateProjectionMatrix();
+    }
+
+    startCinematic() {
+
+        //Stop ongoing cinematic shot chaining
+        this.stopCinematic();
+
+        //Start the first shot in cinematic sequence
+        this.mCineShotsList[0].start();
+    }
+
+    //Stop cinematic camera movement
+    stopCinematic() {
+        this.mCineShotsList.forEach(shot => shot.stop());
+    }
+}
+
+--------------------
+
+config.js
+---------
+
+/*
+ * Project :WebGL Car Configurator
+ * File: config.js
+ * Description : Asset configuration file
+ * Date : 10/09/2021
+ * License : MIT
+ * Author : RendercodeNinja
+ * URL : https://github.com/RendercodeNinja
+ */
+
+//Model Paths
+export const STAGE_PATH = 'assets/stage/';
+export const ACTIVE_PATH = 'assets/aventador/';
+
+//Environment EXR
+export const EXR_PATH = 'assets/exr/';
+export const EXR_FILE = 'royal_esplanade_1k.exr';
+
+//Audio File
+export const AUDIO_FILE = 'assets/audio_track.mp3';
+
+
+------------
+
+handController.js
+-----------------
+
+import * as THREE from 'three'; // make sure THREE is accessible
+import { Hands } from '@mediapipe/hands';
+import { Camera } from '@mediapipe/camera_utils';
+
+export class HandController {
+  constructor({ videoEl, overlayCanvas, orbitControls, camera, renderer, scene, onHover }) {
+    this.videoEl = videoEl;
+    this.overlayCanvas = overlayCanvas;
+    this.ctx = overlayCanvas ? overlayCanvas.getContext('2d') : null;
+
+    this.controls = orbitControls;
+    this.camera = camera;
+    this.renderer = renderer;
+    this.scene = scene;
+    this.onHover = onHover;
+
+    this.pinchThreshold = 0.07;
+    this.deadZone = 0.004;
+    this.moveSmoothing = 0.5;
+    this.rotateSensitivity = 0.7;
+    this.zoomSensitivity = 2.0;
+
+    this.prevCenter = null;
+    this.prevDelta = { x: 0, y: 0 };
+    this.prevGap = null;
+    this.autoRotateHeld = false;
+    this.lastPalmToggle = 0;
+    this.isPinching = false;
+
+    // Spherical coordinates to control rotation
+    this.spherical = new THREE.Spherical();
+    this.spherical.setFromVector3(this.camera.position.clone().sub(this.controls.target));
+
+    this._onResults = this._onResults.bind(this);
+
+    this.handModel = new THREE.Group();
+    this.scene.add(this.handModel);
+
+    // Create a material for the landmarks
+    const landmarkMaterial = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+    const landmarkGeometry = new THREE.SphereGeometry(0.01, 8, 8);
+
+    // Create meshes for each landmark and add them to the group
+    for (let i = 0; i < 21; i++) { // 21 landmarks per hand
+      const landmarkMesh = new THREE.Mesh(landmarkGeometry, landmarkMaterial);
+      this.handModel.add(landmarkMesh);
+    }
+  }
+
+  async init() {
+    this.hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    this.hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    this.hands.onResults(this._onResults);
+
+    this.cameraHelper = new Camera(this.videoEl, {
+      onFrame: async () => { await this.hands.send({ image: this.videoEl }); },
+      width: 640,
+      height: 480,
+    });
+    await this.cameraHelper.start();
+
+    console.log('MediaPipe Hands started');
+  }
+
+  static dist(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  static center(landmarks) {
+    let x = 0, y = 0;
+    for (const lm of landmarks) {
+      x += lm.x; y += lm.y;
+    }
+    return { x: x / landmarks.length, y: y / landmarks.length };
+  }
+
+  static isPinching(landmarks, threshold) {
+    if (!landmarks[4] || !landmarks[8]) return false;
+    return HandController.dist(landmarks[4], landmarks[8]) < threshold;
+  }
+
+  static isOpenPalm(landmarks) {
+    const wrist = landmarks[0];
+    const tips = [4, 8, 12, 16, 20].map(i => landmarks[i]).filter(Boolean);
+    if (!wrist || tips.length === 0) return false;
+    const avgDistance = tips.reduce((sum, p) => sum + HandController.dist(p, wrist), 0) / tips.length;
+    return avgDistance > 0.25;
+  }
+
+  _drawOverlay(results) {
+    // if (!this.ctx) return;
+    // const canvas = this.overlayCanvas;
+    // const ctx = this.ctx;
+
+    // ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // ctx.save();
+    // ctx.translate(canvas.width, 0);
+    // ctx.scale(-1, 1);
+
+    // if (results.image) ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+    // if (results.multiHandLandmarks) {
+    //   for (const landmarks of results.multiHandLandmarks) {
+    //     drawConnectors(ctx, landmarks, HAND_CONNECTIONS, { color: '#00FF7F', lineWidth: 2 });
+    //     drawLandmarks(ctx, landmarks, { color: '#FF0000', lineWidth: 1, radius: 2 });
+    //   }
+    // }
+    // ctx.restore();
+  }
+
+
+  _onResults(results) {
+
+    // Access the world landmarks for 3D positioning
+    const handsPro = results.multiHandWorldLandmarks || [];
+    const landmarks = results.multiHandLandmarks?.[0];
+
+    // This section handles the 3D hand model projection
+    if (landmarks) {
+      this.handModel.visible = true;
+
+      // Use the normalized 2D screen coordinates from MediaPipe
+      const mirroredX = 1 - landmarks[9].x; // Use the middle finger base as a center point
+      const normalizedY = landmarks[9].y;
+
+      // Apply a fixed shift to the x-coordinate to move the projection to the right.
+      const shiftX = 0.18; // Adjust this value to control the rightward shift.
+      const shiftedX = mirroredX + shiftX;
+
+      // Convert the normalized 2D coordinates to a 3D position in front of the camera
+      const vector = new THREE.Vector3(
+        (shiftedX * 2) - 1,
+        -((normalizedY * 2) - 1),
+        0.5
+      );
+      vector.unproject(this.camera);
+
+      const dir = vector.sub(this.camera.position).normalize();
+      const distance = 3; // Set a fixed distance for the hand model from the camera
+      const position = this.camera.position.clone().add(dir.multiplyScalar(distance));
+
+      // Update the position of the entire hand model group
+      this.handModel.position.copy(position);
+
+      const scaleFactorX = 2.5;
+      const scaleFactorY = 1.5;
+      const scaleFactorZ = 1.5;
+
+      // Update the position of each landmark relative to the hand model's new position.
+      landmarks.forEach((landmark, index) => {
+        const scaledX = (landmark.x - landmarks[9].x) * -scaleFactorX;
+        const scaledY = -(landmark.y - landmarks[9].y) * scaleFactorY;
+        const scaledZ = (landmark.z - landmarks[9].z) * scaleFactorZ;
+        this.handModel.children[index].position.set(scaledX, scaledY, scaledZ);
+      });
+
+      // This section handles the 2D cursor for HTML interaction
+      const indexFingerTip = landmarks[8];
+      // Apply the same right shift to the 2D cursor's screen position.
+      const shiftedCursorX = (1 - indexFingerTip.x) + shiftX;
+      const screenX = shiftedCursorX * window.innerWidth;
+      const screenY = (1 - indexFingerTip.y) * window.innerHeight;
+
+      if (this.onHover) {
+        this.onHover({ x: screenX, y: screenY });
+      }
+
+    } else {
+      this.handModel.visible = false;
+    }
+
+    this._drawOverlay(results);
+
+    const hands = results.multiHandLandmarks || [];
+    if (hands.length === 0) {
+      this.prevCenter = null;
+      this.prevDelta = { x: 0, y: 0 };
+      this.prevGap = null;
+      this.isPinching = false;
+      return;
+    }
+
+    const enriched = hands
+      .map(lm => ({ lm, center: HandController.center(lm) }))
+      .sort((a, b) => a.center.x - b.center.x);
+
+    const left = enriched[0];
+    const right = enriched[1] || null;
+
+    const leftPinch = HandController.isPinching(left.lm, this.pinchThreshold);
+    const rightPinch = right ? HandController.isPinching(right.lm, this.pinchThreshold) : false;
+    const anyPinch = leftPinch || rightPinch;
+    const twoPinch = leftPinch && rightPinch;
+
+    const now = performance.now();
+    if (hands.length === 1 && HandController.isOpenPalm(left.lm)) {
+      if (now - this.lastPalmToggle > 800) {
+        this.autoRotateHeld = !this.autoRotateHeld;
+        this.controls.autoRotate = !this.autoRotateHeld;
+        this.lastPalmToggle = now;
+      }
+    }
+
+    let centerX = left.center.x;
+    let centerY = left.center.y;
+    if (right) {
+      centerX = (left.center.x + right.center.x) / 2;
+      centerY = (left.center.y + right.center.y) / 2;
+    }
+    const center = { x: centerX, y: centerY };
+
+    let dx = 0, dy = 0;
+    if (this.prevCenter) {
+      dx = center.x - this.prevCenter.x;
+      dy = center.y - this.prevCenter.y;
+
+      if (Math.abs(dx) < this.deadZone) dx = 0;
+      if (Math.abs(dy) < this.deadZone) dy = 0;
+
+      dx = this.prevDelta.x * this.moveSmoothing + dx * (1 - this.moveSmoothing);
+      dy = this.prevDelta.y * this.moveSmoothing + dy * (1 - this.moveSmoothing);
+    }
+    this.prevCenter = center;
+    this.prevDelta = { x: dx, y: dy };
+
+    if (anyPinch && !twoPinch) {
+      this.isPinching = true;
+      // Update spherical coordinates for rotation
+      this.spherical.theta += dx * Math.PI * this.rotateSensitivity;    // azimuth
+      this.spherical.phi -= dy * Math.PI * this.rotateSensitivity;      // polar
+
+      // Clamp polar angle
+      this.spherical.phi = Math.min(Math.max(0.001, this.spherical.phi), Math.PI - 0.001);
+
+      // Convert spherical to Cartesian coords
+      const offset = new THREE.Vector3();
+      offset.setFromSpherical(this.spherical);
+
+      this.camera.position.copy(this.controls.target).add(offset);
+      this.camera.lookAt(this.controls.target);
+
+      this.controls.update();
+      return;
+    }
+
+    if (twoPinch && right) {
+      this.isPinching = true;
+      const gap = Math.hypot(right.center.x - left.center.x, right.center.y - left.center.y);
+
+      if (this.prevGap !== null) {
+        const gapDelta = gap - this.prevGap;
+
+        if (Math.abs(gapDelta) > this.deadZone) {
+          const scale = 1 + gapDelta * this.zoomSensitivity;
+
+          // Calculate direction vector from target to camera
+          const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+          // Calculate the current distance
+          let distance = this.camera.position.distanceTo(this.controls.target);
+          // Apply the zoom scale
+          distance *= scale;
+          // Get the new camera position
+          const newPos = this.controls.target.clone().add(dir.multiplyScalar(distance));
+          this.camera.position.copy(newPos);
+          // Optionally, clamp to OrbitControls' minDistance and maxDistance
+          if (this.controls.minDistance !== undefined && distance < this.controls.minDistance) {
+            this.camera.position.copy(this.controls.target.clone().add(dir.multiplyScalar(this.controls.minDistance)));
+          }
+          if (this.controls.maxDistance !== undefined && distance > this.controls.maxDistance) {
+            this.camera.position.copy(this.controls.target.clone().add(dir.multiplyScalar(this.controls.maxDistance)));
+          }
+          this.controls.update();
+
+        }
+      }
+      this.prevGap = gap;
+      return;
+    }
+
+    this.isPinching = false;
+    this.prevGap = null;
+  }
+}
+
+
+----------------
+
+interface.js
+------------
+
+export const Interface = (() => {
+    let metaData = {}; // Metadata reference
+    let cBodyColor; // Current Body Color
+    let cOVRMColor; // Current MirrorCover Color
+
+    // Callbacks
+    let cbOnEntityColor = (target, color) => void 0;
+    let cbOnEntityVisible = (target) => void 0;
+
+    // Append texture swatches
+    const appendTextureSwatches = (container, config, cb) => {
+        $(container).empty();
+        config.designs.forEach(design => {
+            const url = `assets/aventador/${design.thumb}.png`;
+            const swatch = `<li><button class="texture-swatch" style="background-image: url(${url})">${design.name}</button></li>`;
+            $(container).append(swatch);
+            $(container).find('.texture-swatch').last().on('click', () => cb(design.value));
+        });
+    };
+    // Append color swatches
+    const appendColorSwatches = (container, config, def, cb) => {
+        $(container).empty();
+        const colorList = def ? [{ "name": "", "value": def }, ...config.colors] : config.colors;
+        colorList.forEach(color => {
+            const swatch = `<li><button class="color-swatch" style="background: ${color.value}">${color.name}</button></li>`;
+            $(container).append(swatch);
+            $(container).find('.color-swatch').last().on('click', () => {
+                cb(config.target, color.value);
+                if (config.target === 'Mt_Body.003') {
+                    // Update the mirror cover color if it's not custom
+                    const ovrColorExists = config.colors.some(c => c.value === cOVRMColor);
+                    if (!ovrColorExists) {
+                        cb('Mt_MirrorCover.003', '#000000'); // Set mirror cover color to black
+                        cOVRMColor = '#000000'; // Update current OVRM color
+                    }
+                    cBodyColor = color.value; // Update current body color
+
+                    // Automatically update mirror color on the model
+                    if ($('#mirror_colors').is(':visible')) {
+                        appendColorSwatches('#mirror_colors > ul', metaData.mirror_colors, cBodyColor, cbOnEntityColor);
+                    }
+                }
+            });
+        });
+    };
+
+
+    // Event - Configuration Tab Clicked
+    const onConfigTabClicked = (item) => {
+        const target = $(item.currentTarget);
+        const tabId = target.data('id');
+
+        // Check if the clicked tab is already active
+        const isActive = target.hasClass('active');
+
+        // Remove active class from all tabs and hide all options initially
+        $('.config-tab').removeClass('active');
+        $('.config-options').hide();
+        $('.config-options').css({
+            'transform': 'translateX(-200px)'
+        });
+
+        // Reset transform for config-tab__list
+        $('.config-tab__list').css({
+            'transform': 'translateX(-152px)'
+        });
+
+        // If the tab clicked is not active, show its options
+        if (!isActive) {
+            if (tabId === 'accessories') {
+                $('#accessories').show();
+            } else if (tabId === 'environment_designs') {
+                $('#environment_designs').show();
+            } else if (tabId === 'environment_models') {
+                $('#environment_models').show();
+            } else if (tabId === 'viewpoint') {
+                $('#viewpoint').show();
+            } else if (tabId === 'wheel_designs') {
+                $('#wheel_designs').show();
+                appendTextureSwatches('#wheel_designs > ul', metaData[tabId], cbOnEntityVisible); // Assuming metaData[tabId] has wheel designs
+            } else {
+                $(`#${tabId}`).show();
+                if (tabId === 'vehicle_designs') {
+                    appendTextureSwatches(`#${tabId} > ul`, metaData[tabId], cbOnEntityVisible);
+                }
+                else if (tabId === 'body_colors') {
+                    appendColorSwatches(`#${tabId} > ul`, metaData[tabId], cBodyColor, cbOnEntityColor);
+                    // Also update mirror colors when body colors are clicked
+                    if ($('#mirror_colors').is(':visible')) {
+                        appendColorSwatches('#mirror_colors > ul', metaData.mirror_colors, cBodyColor, cbOnEntityColor);
+                    }
+                } else {
+                    const defaultColor = (tabId === 'mirror_colors') ? cBodyColor : null;
+                    appendColorSwatches(`#${tabId} > ul`, metaData[tabId], defaultColor, cbOnEntityColor);
+                }
+
+            }
+            // Add active class to the clicked tab
+            target.addClass('active');
+        }
+        else {
+            // Move config-tab__list to the left to accommodate config-options__wrap
+            $('.config-tab__list').css({
+                'transform': 'translateX(0px)'
+            });
+        }
+    };
+    // Initialize Interface
+    const initialize = (meta) => {
+        metaData = meta;
+        cBodyColor = meta.body_colors.colors[meta.body_colors.default].value;
+        cOVRMColor = meta.mirror_colors.colors[meta.mirror_colors.default].value;
+        // $('body').append(PALETTE_HTML);
+        $('.config-tab').on('click', onConfigTabClicked);
+    };
+
+    // Set Callbacks
+    const setOnEntityColor = (cb) => { cbOnEntityColor = cb; };
+    const setOnEntityVisible = (cb) => { cbOnEntityVisible = cb; };
+
+    // Return Public Methods
+    return { initialize, setOnEntityColor, setOnEntityVisible };
+})();
+Interface.setOnEntityColor((target, color) => {
+    console.log(`Entity ${target} color changed to ${color}`);
+    // Update cBodyColor or cOVRMColor as needed
+    if (target === 'Mt_Body.003') {
+        cBodyColor = color;
+    } else if (target === 'Mt_MirrorCover.003') {
+        cOVRMColor = color;
+    }
+});
+
+Interface.setOnEntityVisible((target) => {
+    console.log(`Entity ${target} visibility toggled`);
+});
+
+const initialize = (meta) => {
+    //Cache meta data
+    metaData = meta;
+    //Cache default body color
+    cBodyColor = meta.body_colors.colors[meta.body_colors.default].value;
+    //Cache default OVRM color
+    cOVRMColor = meta.mirror_colors.colors[meta.mirror_colors.default].value;
+    //Append the Configurator palette to body
+    $('body').append(PALETTE_HTML);
+    //Bind Event - Tab item clicked
+    $('.config-tab', PALETTE_HTML).on('click', onConfigTabClicked);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const configIcons = document.querySelectorAll('.config-icon'); // Assuming .config-icon is the correct class for your images
+
+    configIcons.forEach(icon => {
+        icon.addEventListener('click', function () {
+            // Check if the current icon is already active
+            const isActive = this.style.backgroundColor === 'black';
+
+            // Reset all icons to their normal state
+            configIcons.forEach(icon => {
+                icon.style.backgroundColor = ''; // Reset background color
+                icon.classList.remove('animate-to-palette'); // Remove animation class
+            });
+
+            // If the current icon was not active, set it to active
+            if (!isActive) {
+                this.style.backgroundColor = 'black';
+                this.classList.add('animate-to-palette'); // Apply animation class
+            }
+            // If it was active, it's already been reset to normal state above
+        });
+    });
+});
+
+
+---------------
+
+
+sceneManager.js
+---------------
+
+/*
+ * Project :WebGL Car Configurator
+ * File: sceneManager.js
+ * Description : Handles 3D scene management
+ * Date : 10/09/2021
+ * License : MIT
+ * Author : RendercodeNinja
+ * URL : https://github.com/RendercodeNinja
+ */
+
+import { Mesh, MeshBasicMaterial } from 'three';
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
+import { ACTIVE_PATH, STAGE_PATH } from './config';
+import { ColorUtils } from './utilities';
+import * as TWEEN from '@tweenjs/tween.js';
+
+export const SceneManager = (() => {
+
+    //glTF Loader
+    let glTFLoader = null;
+    //Reference to the model object
+    let mActiveModel = null;
+
+    //Method - Initialize SceneManager
+    const init = (loaderManager) => {
+        //Create a GLTF Loader
+        glTFLoader = new GLTFLoader(loaderManager);
+    }
+
+    //Method - Load Stage Model
+    const loadStage = (scene) => {
+
+        //Throw error if SceneManager not initialized
+        if (!glTFLoader)
+            throw new Error('SceneManager init should be called.');
+
+        //Use glTF loader to load the Stage model
+        glTFLoader.setPath(STAGE_PATH).load('Lamborghini.glb', model => {
+
+            //Add environment model to scene
+            // scene.add(model.scene);
+        });
+    }
+
+    //Method - Load Active Model with Meta
+    const loadActiveModel = (scene, meta) => {
+
+        //Throw error if SceneManager not initialized
+        if (!glTFLoader)
+            throw new Error('SceneManager init should be called.');
+
+        //Get the defaults for configurable
+        const defBody = meta.body_colors.default;
+        const defMirror = meta.mirror_colors.default;
+        const defAlloys = meta.wheel_colors.default;
+        const defInterior = meta.interior_colors.default;
+        const defCaliper = meta.caliper_colors.default;
+
+        //Get the startup colors for configurable
+        const dfCol_Body = ColorUtils.webColorToHex(meta.body_colors.colors[defBody].value);
+        const dfCol_Mirror = ColorUtils.webColorToHex(meta.mirror_colors.colors[defMirror].value);
+        const dfCol_Alloys = ColorUtils.webColorToHex(meta.wheel_colors.colors[defAlloys].value);
+        const dfCol_Interior = ColorUtils.webColorToHex(meta.interior_colors.colors[defInterior].value);
+        const dfCol_Caliper = ColorUtils.webColorToHex(meta.caliper_colors.colors[defCaliper].value);
+
+        //Use glTF loader to load the active model
+        glTFLoader.setPath(ACTIVE_PATH).load('Lamborghini.glb', model => {
+
+            //Cache active model for this instance
+            mActiveModel = model.scene;
+            mActiveModel.scale.set(0.5, 0.5, 0.5);
+            mActiveModel.position.set(0, 1, 3);
+            console.log(mActiveModel.position);
+            //Iterate through the Aventador model
+            mActiveModel.traverse(obj => {
+
+                //If object is a mesh with material
+                if (obj instanceof Mesh) {
+
+                    //Set Color - Body
+                    if (obj.material.name === '.003')
+                        obj.material.color = dfCol_Body;
+                    //Set Color - Mirror Cover
+                    if (obj.material.name === 'Mt_MirrorCover')
+                        obj.material.color = dfCol_Mirror;
+                    //Set Color - Alloys
+                    if (obj.material.name === 'Mt_AlloyWheels')
+                        obj.material.color = dfCol_Alloys;
+                    //set color - interior
+                    if (obj.material.name === 'Mt_Interior_Black')
+                        obj.material.color = dfCol_Interior;
+                    //Set Color -Calipers
+                    if (obj.material.name === 'Mt_BrakeCaliper')
+                        obj.material.color = dfCol_Caliper;
+                    //Override Shadow Plane - Use MeshBasicMaterial
+                    if (obj.material.name === 'Mt_Shadow_Plane')
+                        obj.material = new MeshBasicMaterial({ color: 0xffffff, map: obj.material.map, transparent: true })
+                }
+
+                //If this is a rim object and not the first type
+                if (obj.name.includes('Obj_Rim') && !obj.name.includes(meta.wheel_designs.designs[0].value))
+                    obj.visible = false;
+
+                // if (obj.name.includes('Obj_Rim') && !obj.name.includes(meta.vehicle_designs.designs[0].value))
+                //     obj.visible = false;
+            })
+
+            //Add Aventador model to scene
+            scene.add(mActiveModel)
+        })
+    }
+
+
+
+    //template simran
+    document.addEventListener('DOMContentLoaded', function () {
+        // Assuming orbitControls and camera are your custom variables that hold the respective objects
+
+        var frontViewImg = document.getElementById('front-viewpoint');
+        frontViewImg.addEventListener('click', function () {
+            mActiveModel.rotation.y = 0;
+
+        });
+
+        var rearViewImg = document.getElementById('rear-viewpoint');
+        rearViewImg.addEventListener('click', function () {
+            const angle = Math.PI; // 180 degrees in radians
+            mActiveModel.rotation.y += angle;
+        });
+
+        var defaultViewImg = document.getElementById('default-viewpoint');
+        defaultViewImg.addEventListener('click', function () {
+            mActiveModel.rotation.y = Math.PI / 2;
+        });
+
+
+
+    });
+
+    //Method - Set entity color by material name
+    const setEntityColor = (targetMat, webColor) => {
+
+        //Iterate through the Aventador model
+        mActiveModel.traverse(obj => {
+
+            //If object is a mesh with material
+            if (obj instanceof Mesh) {
+
+                //If material name matched
+                if (obj.material.name === targetMat) {
+
+                    //Set material color from converted web color
+                    obj.material.color = ColorUtils.webColorToHex(webColor);
+                }
+            }
+        });
+    }
+
+    //Method - Set entity visibility by object name
+    const setEntityVisible = (targetName) => {
+
+        //Iterate through the Aventador model
+        mActiveModel.traverse(obj => {
+
+            //If this is a rim object
+            if (obj.name.includes('Obj_Rim')) {
+
+                //Show if name matches target, else hide it
+                obj.visible = obj.name.includes(targetName)
+            }
+
+        });
+    }
+
+
+    //Method - Animate car door open/close
+    // 'open' is a boolean: true to open, false to close
+    const animateDoor = (open) => {
+        console.log('animateDoor called, open:', open);
+        if (!mActiveModel) {
+            console.log('No active model loaded');
+            return;
+        }
+
+        // Find all relevant objects
+        const foundObjects = [];
+        mActiveModel.traverse(obj => {
+            if (obj.name === 'Obj_Side_Doors' || obj.name === 'Obj_ORVM') {
+                foundObjects.push(obj);
+            }
+        });
+        if (foundObjects.length === 0) return;
+
+        // Animate rotation for each object using Tween.js
+        const targetRotation = open ? 1.2741 : 0;
+        if (typeof TWEEN !== 'undefined') {
+            foundObjects.forEach(obj => {
+                new TWEEN.Tween(obj.rotation)
+                    .to({ y: targetRotation }, 1000)
+                    .easing(TWEEN.Easing.Quadratic.Out)
+                    .start();
+            });
+            console.log('Starting Tween animation for each door object');
+        } else {
+            foundObjects.forEach(obj => {
+                obj.rotation.y = targetRotation;
+            });
+            console.log('Tween.js not available, setting rotation instantly');
+        }
+    }
+
+
+
+
+    //Return Public Methods/Properties
+    return { init, loadStage, loadActiveModel, setEntityColor, setEntityVisible, mActiveModel, animateDoor  }
+
+})();
+
+
+---------------
+
+
+utilities.js
+------------
+
+/*
+ * Project :WebGL Car Configurator
+ * File: utilities.js
+ * Description : Utility script with helper functions
+ * Date : 10/09/2021
+ * License : MIT
+ * Author : RendercodeNinja
+ * URL : https://github.com/RendercodeNinja
+ */
+
+import { Color, Euler } from "three";
+
+// Color Utility methods
+export const ColorUtils = {
+
+    //Convert web color format to hex color format (with Gamma correction)
+    webColorToHex: (webColor) => {
+
+        //Convert web color to hex base
+        const hex = parseInt(webColor.replace("#", "0x"));
+
+        //Construct color from hex with Gamma Correction
+        return new Color(hex).convertSRGBToLinear();
+    }
+}
+
+//Network Utility methods
+export const NetworkUtils = {
+
+    //Fetches meta json at provided URL
+    fetchMeta: (path, onSuccess) => {
+
+        //Create an XML request
+        var xhr = new XMLHttpRequest();
+        //Set response type to json
+        xhr.responseType = 'json';
+        //Open metal url
+        xhr.open('GET', `${path}meta.json`, true);
+
+        //Load the url using xhr
+        xhr.onload = () => {
+
+            //Throw success if response available and status OK
+            if (xhr.status == 200 && xhr.response != null)
+                onSuccess(xhr.response)
+            //Else throw error
+            else
+                console.error('Error occurred loading meta JSON. Probably invalid JSON format.');
+        }
+
+        //Execute the xhr request
+        xhr.send(null);
+    }
+}
+
+//Custom Math Utility methods
+export const MathUtils = {
+
+    coordR2L: (point) => {
+
+        //Swap Y and Z with Z=-Y
+        return { x: point.x, y: point.z, z: -point.y };
+    },
+
+    vector3DegToRadian: (point) => {
+        //The per degree converter
+        var degree = Math.PI / 180;
+        //Return the new vector3 in radian
+        return new Euler(point.x * degree, point.y * degree, point.z * degree, 'XYZ');
+    }
+}
+
+//HTML Animation Utility methods
+export const AnimUtils = {
+
+    //Fade in an HTML element by duration
+    fadeElementIn: (element, duration = 500, options = { display: 'block' }, callback) => {
+
+        //Ignore if element not available
+        if (!element)
+            return;
+
+        //Set style to visible/display for opacity to apply
+        element.style.display = options.display;
+        element.style.visibility = "visible";
+        element.style.opacity = 0;
+        element.style.filter = "alpha(opacity=0)";
+
+        //Set initial opacity to 0
+        var opacity = 0;
+
+        //Timed recurring
+        var timer = setInterval(() => {
+
+            //Increment opacity linear
+            opacity += 50 / duration;
+
+            //Exit timer on max opacity
+            if (opacity >= 0.95) {
+
+                //Clear timer
+                clearInterval(timer);
+
+                //Set final values
+                opacity = 1;
+
+                //Invoke callback with element;
+                if (callback) callback(element)
+            }
+
+            //Apply updated opacity
+            element.style.opacity = opacity;
+            element.style.filter = "alpha(opacity=" + opacity * 100 + ")";
+
+        }, 50);
+    },
+
+    //Fade out an HTML element by duration
+    fadeElementOut: (element, duration = 500, callback) => {
+
+        //Ignore if element not available
+        if (!element)
+            return;
+
+        //Opacity
+        let opacity = 1;
+
+        //Timer function
+        let timer = setInterval(() => {
+
+            //Decrement opacity linear
+            opacity -= 50 / duration;
+
+            //Exit timer on min opacity
+            if (opacity <= 0) {
+
+                //Clear timer
+                clearInterval(timer);
+
+                //Set final values
+                opacity = 0;
+                element.style.display = "none";
+                element.style.visibility = "hidden";
+
+                //Invoke callback with element;
+                if (callback)
+                    callback(element);
+            }
+
+            //Apply updated opacity
+            element.style.opacity = opacity;
+            element.style.filter = "alpha(opacity=" + opacity * 100 + ")";
+
+        }, 50);
+    },
+
+    //Fades in volume of an audio element
+    fadeAudioIn: (audio, duration = 1000, options = { max: 1 }, callback) => {
+
+        //Ignore if audio not available
+        if (!audio)
+            return;
+
+        //Set start volume
+        let vol = 0;
+
+        //Reset volume
+        audio.volume = vol;
+        //Start if not playing
+        if (audio.paused) audio.play();
+
+        //Timer function
+        let timer = setInterval(() => {
+
+            //Increment volume linear
+            vol += 50 / duration;
+
+            if (vol >= options.max) {
+
+                //Clear timer
+                clearInterval(timer);
+
+                //Set final values
+                vol = options.max;
+
+                //Invoke callback with element;
+                if (callback) callback(audio)
+            }
+
+            //Apply updated volume
+            audio.volume = vol;
+
+        }, 50)
+    },
+
+    //Fades out volume of an audio element
+    fadeAudioOut: (audio, duration = 1000, callback) => {
+
+        //Ignore if audio not available
+        if (!audio)
+            return;
+
+        //Get start volume
+        let vol = audio.volume;
+
+        //Timer function
+        let timer = setInterval(() => {
+
+            //Decrement volume linear
+            vol -= 50 / duration;
+
+            if (vol <= 0) {
+
+                //Clear timer
+                clearInterval(timer);
+                //Set final values
+                vol = 0;
+
+                //Invoke callback with audio element;
+                if (callback) callback(audio);
+            }
+
+            //Apply updated volume
+            audio.volume = vol;
+
+        }, 50);
+
+    }
+}
+
+---------------
+
+index.html
+----------
+
+<!DOCTYPE html>
+<html>
+
+<head>
+    <!-- The app title -->
+    <title>Automotive Configurator</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+
+    <!-- MediaPipe Hands and Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+
+</head>
+
+<body>
+
+    <!-- Overlay Preloader Element -->
+    <div id="preloader" class="loader overlay">
+        <div class="wrapper">
+            <div class="icon"></div>
+            <p class="title no-select">- LOADING -</p>
+            <p class="desc no-select"></p>
+            <button id="btn-start-demo" class="btn-main">Start</button>
+        </div>
+    </div>
+
+    <!-- Screen Fader -->
+    <div id="screen-fader" class="screen-fader overlay"></div>
+
+    <!-- Welcome Screen -->
+    <div id="welcome-screen" class="ws overlay">
+        <div class="wrapper">
+            <h1 class="no-select">Lamborghini Aventador</h1>
+            <h3 class="no-select">Configurator</h3>
+            <button id="btn-skip-intro">Skip Intro</button>
+        </div>
+    </div>
+    <button class="teleport-to">Teleport To</button>
+    <div class="config-palette" id="config_palette" style="display: none;">
+        <div class="config-palette__wrapper">
+            <ul class="config-tab__list">
+                <li><a class="config-tab config-list" data-id="vehicle_designs"><span><img src="images/vehicle_icon.svg"
+                                class="config-icon-selected"></span></a></li>
+                <li><a class="config-tab config-list" data-id="body_colors"><span><img src="images/color_icon.svg"
+                                class="config-icon"></span></a></li>
+                <li><a class="config-tab config-list" data-id="accessories"><span><img src="images/tint_icon.svg"
+                                class="config-icon"></span></a></li>
+                <li><a class="config-tab config-list" data-id="environment_designs"><span><img
+                                src="images/environment_icon.svg" class="config-icon"></span></a></li>
+                <li><a class="config-tab config-list" data-id="environment_models"><span><img
+                                src="images/environment_icon.svg" class="config-icon"></span></a></li>
+                <li><a class="config-tab config-list" data-id="viewpoint"><span><img src="images/viewpoint_icon.svg"
+                                class="config-icon"></span></a></li>
+                <li><a class="config-list" id="screenshotButton"><span><img src="images/screenhot_icon.svg"
+                                class="config-icon"></span></a></li>
+                <li><a class="config-list" id="open-door-btn"><span><img src="images/opencar.png"
+                                class="config-icon"></span></a></li>
+
+                <li><a class="config-list" id="close-door-btn"><span><img src="images/closecar.png"
+                                class="config-icon"></span></a></li>
+            </ul>
+            <div class="config-options__wrap">
+                <div id="vehicle_designs" class="config-options config-options-inside">
+                    <ul></ul>
+                </div>
+                <div id="body_colors" class="config-options config-options-inside">
+                    <ul></ul>
+                </div>
+                <div id="accessories" class="config-options hidden">
+                    <ul>
+                        <button class="config-tab accessories-inside color-swatch" data-id="mirror_colors">
+                            <li class="accessories-inside-li">side mirrors</li>
+                        </button>
+                        <button class="config-tab accessories-inside color-swatch" data-id="wheel_designs">
+                            <li class="accessories-inside-li">wheels</li>
+                        </button>
+                        <button class="config-tab accessories-inside color-swatch" data-id="wheel_colors">
+                            <li class="accessories-inside-li">wheel color</li>
+                        </button>
+                        <button class="config-tab accessories-inside color-swatch" data-id="caliper_colors">
+                            <li class="accessories-inside-li">Caliper Color</li>
+                        </button>
+                        <button class="config-tab accessories-inside color-swatch" data-id="interior_colors">
+                            <li class="accessories-inside-li">Interior color</li>
+                        </button>
+                    </ul>
+                </div>
+                <div id="environment_designs" class="config-options config-options-inside">
+                    <ul>
+                        <li><img src="images/studio.png" id="environment-img-1"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                        <li><img src="images/warehouse.png" id="environment-img-2"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+
+                    </ul>
+                </div>
+                <div id="environment_models" class="config-options config-options-inside">
+                    <ul>
+
+                        <li><img src="images/forest.png" id="environment-img-3"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                        <li><img src="images/hansaplatz.png" id="environment-img-4"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                    </ul>
+                </div>
+                <div id="viewpoint" class="config-options config-options-inside">
+                    <ul>
+                        <li><img src="images/default.jpg" id="default-viewpoint"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                        <li><img src="images/frontview.jpg" id="front-viewpoint"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                        <li><img src="images/rearview.jpg" id="rear-viewpoint"
+                                style="width:140px; height:140px;margin-bottom: 20px;"></li>
+                    </ul>
+                </div>
+
+            </div>
+            <div class="config-options__wrap">
+                <div id="mirror_colors" class="config-options">
+                    <ul></ul>
+                </div>
+                <div id="wheel_designs" class="config-options">
+                    <ul></ul>
+                </div>
+                <div id="wheel_colors" class="config-options">
+                    <ul></ul>
+                </div>
+                <div id="caliper_colors" class="config-options">
+                    <ul></ul>
+                </div>
+                <div id="interior_colors" class="config-options">
+                    <ul></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Development Environment JS Path -->
+
+    <!-- Webcam preview + landmark overlay (small, bottom-left) -->
+    <video id="mp-video" playsinline autoplay muted style="position:absolute; left:10px; bottom:10px; width:220px; height:165px; border-radius:8px;
+              box-shadow:0 6px 24px rgba(0,0,0,0.35); transform:scaleX(-1); z-index:1000;"></video>
+
+    <canvas id="mp-canvas" width="220" height="165" style="position:absolute; left:10px; bottom:10px; width:220px; height:165px; border-radius:8px;
+               pointer-events:none; z-index:1001;"></canvas>
+
+    <script src="js/app.build.js"></script>
+    <!-- Inside your HTML body -->
+
+</body>
+
+</html>
